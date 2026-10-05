@@ -1,0 +1,387 @@
+# Hand-authored workflow. NOT managed by dotgithub. Do not regenerate with `dotgithub generate`.
+# See docs/pr-security-gate.md for usage.
+name: PR Security Gate
+
+on:
+  workflow_call:
+    inputs:
+      runner_group:
+        description: Self-hosted runner group to use for all jobs
+        type: string
+        required: false
+        default: "7219-mscicdrunners"
+      dep_fail_severity:
+        description: Minimum vulnerability severity to fail the check (low, moderate, high, critical)
+        type: string
+        required: false
+        default: "high"
+      semgrep_fail_severity:
+        description: Minimum Semgrep severity to fail the check (note, warning, error)
+        type: string
+        required: false
+        default: "error"
+      block:
+        description: Whether to fail the check when thresholds are exceeded (false for dry-run)
+        type: boolean
+        required: false
+        default: true
+      dodge_wait_minutes:
+        description: Minutes to wait for semgrep-dodge check before falling back to CLI
+        type: number
+        required: false
+        default: 15
+      semgrep_fallback_config:
+        description: Semgrep config to use when falling back to CLI (e.g. p/default)
+        type: string
+        required: false
+        default: "p/default"
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: read
+  checks: read
+  id-token: write
+
+jobs:
+  deps:
+    name: Dependency Review
+    runs-on:
+      group: ${{ inputs.runner_group }}
+      labels:
+        - self-hosted
+    outputs:
+      vulnerable_changes: ${{ steps.review.outputs.vulnerable-changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Dependency Review
+        id: review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: ${{ inputs.dep_fail_severity }}
+          warn-only: true
+          comment-summary-in-pr: never
+          # Export vulnerable-changes as JSON for the report job
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha }}
+
+  semgrep:
+    name: Semgrep Scan
+    runs-on:
+      group: ${{ inputs.runner_group }}
+      labels:
+        - self-hosted
+    outputs:
+      findings: ${{ steps.normalize.outputs.findings }}
+      source: ${{ steps.normalize.outputs.source }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Wait for Dodge
+        id: dodge
+        uses: actions/github-script@9e0f33e1b30b7f5e63493cc03f56b8d1a2c38b35 # v9.0.0
+        env:
+          WAIT_MINUTES: ${{ inputs.dodge_wait_minutes }}
+        with:
+          script: |
+            const waitMinutes = parseFloat(process.env.WAIT_MINUTES);
+            const timeoutMs = waitMinutes * 60 * 1000;
+            const intervalMs = 30000; // 30s
+            const started = Date.now();
+
+            let dodgeCheck = null;
+
+            while (Date.now() - started < timeoutMs) {
+              const { data: checks } = await github.rest.checks.listForRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: context.payload.pull_request.head.sha,
+                check_name: 'semgrep-dodge',
+              });
+
+              if (checks.check_runs.length > 0) {
+                dodgeCheck = checks.check_runs[0];
+                if (['completed', 'success', 'failure'].includes(dodgeCheck.status) ||
+                    dodgeCheck.conclusion) {
+                  core.info(`Dodge completed: ${dodgeCheck.conclusion}`);
+                  core.setOutput('completed', 'true');
+                  core.setOutput('conclusion', dodgeCheck.conclusion);
+                  return;
+                }
+              }
+
+              const elapsed = Math.floor((Date.now() - started) / 1000);
+              core.info(`Waiting for semgrep-dodge (${elapsed}s elapsed)...`);
+              await new Promise(resolve => setTimeout(resolve, intervalMs));
+            }
+
+            core.warning(`semgrep-dodge did not complete within ${waitMinutes} minutes`);
+            core.setOutput('completed', 'false');
+
+      - name: Fetch Dodge Results
+        if: steps.dodge.outputs.completed == 'true'
+        id: dodge-results
+        uses: actions/github-script@9e0f33e1b30b7f5e63493cc03f56b8d1a2c38b35 # v9.0.0
+        with:
+          script: |
+            const prRef = `refs/pull/${context.payload.pull_request.number}/merge`;
+            const baseRef = `refs/heads/${context.payload.pull_request.base.ref}`;
+
+            // Fetch alerts on PR ref
+            const { data: prAlerts } = await github.rest.codeScanning.listAlertsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tool_name: 'Semgrep OSS',
+              ref: prRef,
+              state: 'open',
+              per_page: 100,
+            });
+
+            // Fetch alerts on base ref
+            const { data: baseAlerts } = await github.rest.codeScanning.listAlertsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tool_name: 'Semgrep OSS',
+              ref: baseRef,
+              state: 'open',
+              per_page: 100,
+            });
+
+            const baseNumbers = new Set(baseAlerts.map(a => a.number));
+            const newAlerts = prAlerts.filter(a => !baseNumbers.has(a.number));
+
+            core.info(`Found ${prAlerts.length} alerts on PR, ${baseAlerts.length} on base, ${newAlerts.length} new`);
+
+            const findings = newAlerts.map(alert => ({
+              rule: alert.rule.id,
+              file: alert.most_recent_instance.location.path,
+              line: alert.most_recent_instance.location.start_line,
+              message: alert.rule.description || alert.most_recent_instance.message.text,
+              severity: alert.rule.security_severity_level || alert.rule.severity || 'note',
+            }));
+
+            return findings;
+
+      - name: Setup JFrog CLI (for fallback)
+        if: steps.dodge.outputs.completed != 'true'
+        uses: jfrog/setup-jfrog-cli@5a4fbe1e30dbb570cc62d2513421c4b9bc3c9959 # v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+        with:
+          oidc-provider-name: github
+
+      - name: Install Semgrep (fallback)
+        if: steps.dodge.outputs.completed != 'true'
+        run: |
+          pip install semgrep==1.178.0
+
+      - name: Run Semgrep CLI (fallback)
+        if: steps.dodge.outputs.completed != 'true'
+        id: semgrep-cli
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CONFIG: ${{ inputs.semgrep_fallback_config }}
+        run: |
+          semgrep scan \
+            --config "$CONFIG" \
+            --baseline-commit "$BASE_SHA" \
+            --json \
+            --output semgrep-output.json || true
+
+          if [ -f semgrep-output.json ]; then
+            echo "Semgrep CLI completed"
+            cat semgrep-output.json
+          else
+            echo '{"results": []}' > semgrep-output.json
+          fi
+
+      - name: Normalize Findings
+        id: normalize
+        uses: actions/github-script@9e0f33e1b30b7f5e63493cc03f56b8d1a2c38b35 # v9.0.0
+        env:
+          DODGE_COMPLETED: ${{ steps.dodge.outputs.completed }}
+          DODGE_FINDINGS: ${{ steps.dodge-results.outputs.result }}
+        with:
+          script: |
+            const dodgeCompleted = process.env.DODGE_COMPLETED === 'true';
+            let findings = [];
+            let source = 'none';
+
+            if (dodgeCompleted) {
+              findings = JSON.parse(process.env.DODGE_FINDINGS || '[]');
+              source = 'dodge';
+            } else {
+              const fs = require('fs');
+              if (fs.existsSync('semgrep-output.json')) {
+                const semgrepOutput = JSON.parse(fs.readFileSync('semgrep-output.json', 'utf8'));
+                findings = (semgrepOutput.results || []).map(r => ({
+                  rule: r.check_id,
+                  file: r.path,
+                  line: r.start.line,
+                  message: r.extra.message,
+                  severity: r.extra.severity || 'warning',
+                }));
+                source = 'cli';
+              }
+            }
+
+            core.setOutput('findings', JSON.stringify(findings));
+            core.setOutput('source', source);
+            core.info(`Normalized ${findings.length} findings from ${source}`);
+
+  report:
+    name: Report Results
+    needs: [deps, semgrep]
+    if: always()
+    runs-on:
+      group: ${{ inputs.runner_group }}
+      labels:
+        - self-hosted
+    steps:
+      - name: Build Report
+        id: build
+        uses: actions/github-script@9e0f33e1b30b7f5e63493cc03f56b8d1a2c38b35 # v9.0.0
+        env:
+          VULNERABLE_CHANGES: ${{ needs.deps.outputs.vulnerable_changes }}
+          SEMGREP_FINDINGS: ${{ needs.semgrep.outputs.findings }}
+          SEMGREP_SOURCE: ${{ needs.semgrep.outputs.source }}
+          DEP_FAIL_SEVERITY: ${{ inputs.dep_fail_severity }}
+          SEMGREP_FAIL_SEVERITY: ${{ inputs.semgrep_fail_severity }}
+          BLOCK_ENABLED: ${{ inputs.block }}
+        with:
+          script: |
+            const vulnChanges = JSON.parse(process.env.VULNERABLE_CHANGES || '[]');
+            const semgrepFindings = JSON.parse(process.env.SEMGREP_FINDINGS || '[]');
+            const semgrepSource = process.env.SEMGREP_SOURCE;
+            const depFailSeverity = process.env.DEP_FAIL_SEVERITY;
+            const semgrepFailSeverity = process.env.SEMGREP_FAIL_SEVERITY;
+            const blockEnabled = process.env.BLOCK_ENABLED === 'true';
+
+            const severityOrder = { low: 1, moderate: 2, high: 3, critical: 4 };
+            const semgrepSeverityOrder = { note: 1, warning: 2, error: 3 };
+
+            let hasBlockingDeps = false;
+            let hasBlockingSemgrep = false;
+
+            // Filter blocking deps
+            const blockingDeps = vulnChanges.filter(v => {
+              const sev = v.severity?.toLowerCase() || 'unknown';
+              return severityOrder[sev] >= severityOrder[depFailSeverity];
+            });
+            hasBlockingDeps = blockingDeps.length > 0;
+
+            // Filter blocking Semgrep
+            const blockingSemgrep = semgrepFindings.filter(f => {
+              const sev = f.severity?.toLowerCase() || 'warning';
+              return semgrepSeverityOrder[sev] >= semgrepSeverityOrder[semgrepFailSeverity];
+            });
+            hasBlockingSemgrep = blockingSemgrep.length > 0;
+
+            const shouldFail = blockEnabled && (hasBlockingDeps || hasBlockingSemgrep);
+            const statusEmoji = shouldFail ? '❌' : '✅';
+
+            let markdown = `<!-- pr-security-gate -->\n`;
+            markdown += `## ${statusEmoji} PR Security Gate\n\n`;
+
+            if (!hasBlockingDeps && !hasBlockingSemgrep && vulnChanges.length === 0 && semgrepFindings.length === 0) {
+              markdown += `✅ No security issues found.\n\n`;
+            } else {
+              if (shouldFail) {
+                markdown += `🚫 **This PR introduces security issues that must be addressed.**\n\n`;
+              }
+
+              // Dependencies table
+              if (vulnChanges.length > 0) {
+                markdown += `### 📦 Dependency Vulnerabilities (${vulnChanges.length})\n\n`;
+                markdown += `| Package | Version | Advisory | Severity | Fixed In |\n`;
+                markdown += `|---------|---------|----------|----------|----------|\n`;
+                vulnChanges.forEach(v => {
+                  const blocking = severityOrder[v.severity?.toLowerCase()] >= severityOrder[depFailSeverity] ? '🚫 ' : '';
+                  markdown += `| ${blocking}${v.manifest || 'unknown'} | ${v.change?.version_to || 'N/A'} | ${v.advisory?.ghsa_id || 'N/A'} | ${v.severity || 'unknown'} | ${v.advisory?.patched_versions || 'N/A'} |\n`;
+                });
+                markdown += `\n`;
+              }
+
+              // Semgrep table
+              if (semgrepFindings.length > 0) {
+                markdown += `### 🔍 Semgrep Findings (${semgrepFindings.length})`;
+                if (semgrepSource === 'cli') {
+                  markdown += ` ⚠️ *Fallback ruleset used (${process.env.semgrep_fallback_config || 'p/default'})*`;
+                }
+                markdown += `\n\n`;
+                markdown += `| Rule | Location | Severity | Message |\n`;
+                markdown += `|------|----------|----------|--------|\n`;
+                semgrepFindings.forEach(f => {
+                  const blocking = semgrepSeverityOrder[f.severity?.toLowerCase()] >= semgrepSeverityOrder[semgrepFailSeverity] ? '🚫 ' : '';
+                  const location = `[\`${f.file}:${f.line}\`](${{github.event.pull_request.html_url}}/files#diff-${Buffer.from(f.file).toString('base64').replace(/=/g, '')}L${f.line})`;
+                  markdown += `| ${blocking}${f.rule} | ${location} | ${f.severity} | ${f.message} |\n`;
+                });
+                markdown += `\n`;
+              }
+
+              // How to fix
+              markdown += `### 🛠️ How to Fix\n\n`;
+              if (hasBlockingDeps) {
+                markdown += `**Dependencies:** Update to the versions listed in "Fixed In", or wait for Dependabot to create a PR.\n`;
+              }
+              if (hasBlockingSemgrep) {
+                markdown += `**Semgrep:** Review findings above. To suppress false positives, add \`# nosemgrep: <rule-id>\` above the line.\n`;
+              }
+            }
+
+            core.setOutput('markdown', markdown);
+            core.setOutput('should_fail', shouldFail.toString());
+            return markdown;
+
+      - name: Update PR Comment
+        if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+        uses: actions/github-script@9e0f33e1b30b7f5e63493cc03f56b8d1a2c38b35 # v9.0.0
+        env:
+          COMMENT_BODY: ${{ steps.build.outputs.markdown }}
+        with:
+          script: |
+            const marker = '<!-- pr-security-gate -->';
+            const body = process.env.COMMENT_BODY;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+
+            const existing = comments.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: body,
+              });
+              core.info('Updated existing comment');
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: body,
+              });
+              core.info('Created new comment');
+            }
+
+      - name: Write Step Summary
+        env:
+          SUMMARY_MARKDOWN: ${{ steps.build.outputs.markdown }}
+        run: |
+          echo "$SUMMARY_MARKDOWN" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check Status
+        if: steps.build.outputs.should_fail == 'true'
+        run: |
+          echo "::error::Security gate failed - blocking issues found"
+          exit 1
