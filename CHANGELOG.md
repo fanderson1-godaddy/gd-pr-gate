@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-06
+
+### Changed
+- **Silent success:** PR comments are now only posted when security issues are found. Clean PRs pass silently without noise.
+- Existing comments are deleted when issues are resolved.
+
+### Added
+- `has_issues` output to track whether any security issues were detected.
+
 ## [1.0.0] - 2026-10-05
 
 ### Added
@@ -19,5 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation: usage, how-it-works, behavior diagram
 - Support for 9 Donut repos (dify-*, marketing-*)
 
-[Unreleased]: https://github.com/gdcorp-actions/gd-pr-gate/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/gdcorp-actions/gd-pr-gate/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/gdcorp-actions/gd-pr-gate/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/gdcorp-actions/gd-pr-gate/releases/tag/v1.0.0
