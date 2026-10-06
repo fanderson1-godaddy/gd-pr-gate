@@ -334,8 +334,10 @@ jobs:
               }
             }
 
+            const hasIssues = vulnChanges.length > 0 || semgrepFindings.length > 0;
             core.setOutput('markdown', markdown);
             core.setOutput('should_fail', shouldFail.toString());
+            core.setOutput('has_issues', hasIssues.toString());
             return markdown;
 
       - name: Update PR Comment
@@ -343,10 +345,12 @@ jobs:
         uses: actions/github-script@9e0f33e1b30b7f5e63493cc03f56b8d1a2c38b35 # v9.0.0
         env:
           COMMENT_BODY: ${{ steps.build.outputs.markdown }}
+          HAS_ISSUES: ${{ steps.build.outputs.has_issues }}
         with:
           script: |
             const marker = '<!-- pr-security-gate -->';
             const body = process.env.COMMENT_BODY;
+            const hasIssues = process.env.HAS_ISSUES === 'true';
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
@@ -356,6 +360,24 @@ jobs:
 
             const existing = comments.find(c => c.body.includes(marker));
 
+            // If no issues found and there's an existing comment, delete it
+            if (!hasIssues && existing) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+              });
+              core.info('Deleted existing comment (no issues found)');
+              return;
+            }
+
+            // If no issues and no existing comment, do nothing (silent success)
+            if (!hasIssues) {
+              core.info('No issues found - skipping comment');
+              return;
+            }
+
+            // Issues found - post or update comment
             if (existing) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
