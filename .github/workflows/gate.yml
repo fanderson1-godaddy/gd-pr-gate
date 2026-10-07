@@ -254,7 +254,7 @@ jobs:
             const depsResult = process.env.DEPS_RESULT;
             const semgrepResult = process.env.SEMGREP_RESULT;
 
-            // Bug 3 fix: Detect if upstream jobs failed
+            // Detect if upstream jobs failed
             const depsJobFailed = depsResult === 'failure';
             const semgrepJobFailed = semgrepResult === 'failure';
 
@@ -289,7 +289,7 @@ jobs:
             const semgrepJobFailed = process.env.SEMGREP_JOB_FAILED === 'true';
 
             const severityOrder = { low: 1, moderate: 2, high: 3, critical: 4 };
-            // Bug 2 fix: Map Dodge severity levels (low/medium/high/critical) to Semgrep levels
+            // Map Dodge severity levels (low/medium/high/critical) to Semgrep levels
             const semgrepSeverityOrder = {
               note: 1,
               low: 1,       // Dodge low -> note
@@ -303,7 +303,7 @@ jobs:
             let hasBlockingDeps = false;
             let hasBlockingSemgrep = false;
 
-            // Bug 1 fix: Read severity from vulnerabilities array
+            // Read severity from vulnerabilities array
             const blockingDeps = vulnChanges.filter(v => {
               // dependency-review-action nests severity in vulnerabilities[]
               let sev = 'unknown';
@@ -327,7 +327,7 @@ jobs:
             });
             hasBlockingSemgrep = blockingSemgrep.length > 0;
 
-            // Bug 3 fix: Fail if upstream jobs failed (prevents false "clean" reports)
+            // Fail if upstream jobs failed (prevents false "clean" reports)
             const jobFailure = depsJobFailed || semgrepJobFailed;
             const shouldFail = blockEnabled && (hasBlockingDeps || hasBlockingSemgrep || jobFailure);
             const statusEmoji = shouldFail ? '❌' : '✅';
@@ -335,7 +335,7 @@ jobs:
             let markdown = `<!-- pr-security-gate -->\n`;
             markdown += `## ${statusEmoji} PR Security Gate\n\n`;
 
-            // Bug 3 fix: Report job failures explicitly
+            // Report job failures explicitly
             if (jobFailure) {
               markdown += `❌ **Scan job failure** - one or more security scans did not complete successfully.\n\n`;
               if (depsJobFailed) {
@@ -360,7 +360,7 @@ jobs:
                 markdown += `| Package | Version | Advisory | Severity | Fixed In |\n`;
                 markdown += `|---------|---------|----------|----------|----------|\n`;
                 vulnChanges.forEach(v => {
-                  // Bug 1 fix: Read severity from vulnerabilities array for display
+                  // Read severity from vulnerabilities array for display
                   let displaySeverity = 'unknown';
                   let highestSeverity = 0;
                   if (v.vulnerabilities && v.vulnerabilities.length > 0) {
