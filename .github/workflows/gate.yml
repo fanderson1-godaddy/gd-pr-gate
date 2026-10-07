@@ -243,6 +243,28 @@ jobs:
       labels:
         - self-hosted
     steps:
+      - name: Check Job Status
+        id: check_status
+        uses: actions/github-script@9e0f33e1b30b7f5e63493cc03f56b8d1a2c38b35 # v9.0.0
+        env:
+          DEPS_RESULT: ${{ needs.deps.result }}
+          SEMGREP_RESULT: ${{ needs.semgrep.result }}
+        with:
+          script: |
+            const depsResult = process.env.DEPS_RESULT;
+            const semgrepResult = process.env.SEMGREP_RESULT;
+
+            // Bug 3 fix: Detect if upstream jobs failed
+            const depsJobFailed = depsResult === 'failure';
+            const semgrepJobFailed = semgrepResult === 'failure';
+
+            core.setOutput('deps_job_failed', depsJobFailed.toString());
+            core.setOutput('semgrep_job_failed', semgrepJobFailed.toString());
+
+            if (depsJobFailed || semgrepJobFailed) {
+              core.warning(`Upstream job failures detected - deps: ${depsResult}, semgrep: ${semgrepResult}`);
+            }
+
       - name: Build Report
         id: build
         uses: actions/github-script@9e0f33e1b30b7f5e63493cc03f56b8d1a2c38b35 # v9.0.0
@@ -253,6 +275,8 @@ jobs:
           DEP_FAIL_SEVERITY: ${{ inputs.dep_fail_severity }}
           SEMGREP_FAIL_SEVERITY: ${{ inputs.semgrep_fail_severity }}
           BLOCK_ENABLED: ${{ inputs.block }}
+          DEPS_JOB_FAILED: ${{ steps.check_status.outputs.deps_job_failed }}
+          SEMGREP_JOB_FAILED: ${{ steps.check_status.outputs.semgrep_job_failed }}
         with:
           script: |
             const vulnChanges = JSON.parse(process.env.VULNERABLE_CHANGES || '[]');
@@ -261,16 +285,35 @@ jobs:
             const depFailSeverity = process.env.DEP_FAIL_SEVERITY;
             const semgrepFailSeverity = process.env.SEMGREP_FAIL_SEVERITY;
             const blockEnabled = process.env.BLOCK_ENABLED === 'true';
+            const depsJobFailed = process.env.DEPS_JOB_FAILED === 'true';
+            const semgrepJobFailed = process.env.SEMGREP_JOB_FAILED === 'true';
 
             const severityOrder = { low: 1, moderate: 2, high: 3, critical: 4 };
-            const semgrepSeverityOrder = { note: 1, warning: 2, error: 3 };
+            // Bug 2 fix: Map Dodge severity levels (low/medium/high/critical) to Semgrep levels
+            const semgrepSeverityOrder = {
+              note: 1,
+              low: 1,       // Dodge low -> note
+              warning: 2,
+              medium: 2,    // Dodge medium -> warning
+              error: 3,
+              high: 3,      // Dodge high -> error
+              critical: 4   // Dodge critical -> error (highest)
+            };
 
             let hasBlockingDeps = false;
             let hasBlockingSemgrep = false;
 
-            // Filter blocking deps
+            // Bug 1 fix: Read severity from vulnerabilities array
             const blockingDeps = vulnChanges.filter(v => {
-              const sev = v.severity?.toLowerCase() || 'unknown';
+              // dependency-review-action nests severity in vulnerabilities[]
+              let sev = 'unknown';
+              if (v.vulnerabilities && v.vulnerabilities.length > 0) {
+                // Use the highest severity from all vulnerabilities
+                const severities = v.vulnerabilities.map(vuln => vuln.severity?.toLowerCase()).filter(Boolean);
+                sev = severities.reduce((max, curr) => {
+                  return (severityOrder[curr] || 0) > (severityOrder[max] || 0) ? curr : max;
+                }, 'unknown');
+              }
               return severityOrder[sev] >= severityOrder[depFailSeverity];
             });
             hasBlockingDeps = blockingDeps.length > 0;
@@ -278,19 +321,35 @@ jobs:
             // Filter blocking Semgrep
             const blockingSemgrep = semgrepFindings.filter(f => {
               const sev = f.severity?.toLowerCase() || 'warning';
-              return semgrepSeverityOrder[sev] >= semgrepSeverityOrder[semgrepFailSeverity];
+              const mappedSeverity = semgrepSeverityOrder[sev] || semgrepSeverityOrder['warning'];
+              const threshold = semgrepSeverityOrder[semgrepFailSeverity] || semgrepSeverityOrder['error'];
+              return mappedSeverity >= threshold;
             });
             hasBlockingSemgrep = blockingSemgrep.length > 0;
 
-            const shouldFail = blockEnabled && (hasBlockingDeps || hasBlockingSemgrep);
+            // Bug 3 fix: Fail if upstream jobs failed (prevents false "clean" reports)
+            const jobFailure = depsJobFailed || semgrepJobFailed;
+            const shouldFail = blockEnabled && (hasBlockingDeps || hasBlockingSemgrep || jobFailure);
             const statusEmoji = shouldFail ? '❌' : '✅';
 
             let markdown = `<!-- pr-security-gate -->\n`;
             markdown += `## ${statusEmoji} PR Security Gate\n\n`;
 
-            if (!hasBlockingDeps && !hasBlockingSemgrep && vulnChanges.length === 0 && semgrepFindings.length === 0) {
+            // Bug 3 fix: Report job failures explicitly
+            if (jobFailure) {
+              markdown += `❌ **Scan job failure** - one or more security scans did not complete successfully.\n\n`;
+              if (depsJobFailed) {
+                markdown += `- Dependency scan failed to complete\n`;
+              }
+              if (semgrepJobFailed) {
+                markdown += `- Semgrep scan failed to complete\n`;
+              }
+              markdown += `\nReview the workflow run logs and re-run the gate after fixing the issue.\n\n`;
+            }
+
+            if (!hasBlockingDeps && !hasBlockingSemgrep && vulnChanges.length === 0 && semgrepFindings.length === 0 && !jobFailure) {
               markdown += `✅ No security issues found.\n\n`;
-            } else {
+            } else if (!jobFailure) {
               if (shouldFail) {
                 markdown += `🚫 **This PR introduces security issues that must be addressed.**\n\n`;
               }
@@ -301,8 +360,22 @@ jobs:
                 markdown += `| Package | Version | Advisory | Severity | Fixed In |\n`;
                 markdown += `|---------|---------|----------|----------|----------|\n`;
                 vulnChanges.forEach(v => {
-                  const blocking = severityOrder[v.severity?.toLowerCase()] >= severityOrder[depFailSeverity] ? '🚫 ' : '';
-                  markdown += `| ${blocking}${v.manifest || 'unknown'} | ${v.change?.version_to || 'N/A'} | ${v.advisory?.ghsa_id || 'N/A'} | ${v.severity || 'unknown'} | ${v.advisory?.patched_versions || 'N/A'} |\n`;
+                  // Bug 1 fix: Read severity from vulnerabilities array for display
+                  let displaySeverity = 'unknown';
+                  let highestSeverity = 0;
+                  if (v.vulnerabilities && v.vulnerabilities.length > 0) {
+                    v.vulnerabilities.forEach(vuln => {
+                      const sev = vuln.severity?.toLowerCase();
+                      if (sev && severityOrder[sev] > highestSeverity) {
+                        highestSeverity = severityOrder[sev];
+                        displaySeverity = sev;
+                      }
+                    });
+                  }
+                  const blocking = severityOrder[displaySeverity] >= severityOrder[depFailSeverity] ? '🚫 ' : '';
+                  const ghsaId = v.vulnerabilities?.[0]?.advisory_ghsa_id || 'N/A';
+                  const patchedVersions = v.vulnerabilities?.[0]?.advisory_summary || 'N/A';
+                  markdown += `| ${blocking}${v.manifest || 'unknown'} | ${v.version || 'N/A'} | ${ghsaId} | ${displaySeverity} | ${patchedVersions} |\n`;
                 });
                 markdown += `\n`;
               }
