@@ -11,12 +11,12 @@ on:
         required: false
         default: "7219-mscicdrunners"
       dep_fail_severity:
-        description: Minimum vulnerability severity to fail the check (low, moderate, high, critical)
+        description: Minimum vulnerability severity to fail the check (low, moderate, high, critical). Default "high" blocks high and critical only.
         type: string
         required: false
         default: "high"
       semgrep_fail_severity:
-        description: Minimum Semgrep severity to fail the check (note, warning, error)
+        description: Minimum Semgrep severity to fail the check (note, warning, error). Also maps Dodge severity levels (low->note, medium->warning, high/critical->error). Default "error" blocks high and critical.
         type: string
         required: false
         default: "error"
@@ -288,16 +288,21 @@ jobs:
             const depsJobFailed = process.env.DEPS_JOB_FAILED === 'true';
             const semgrepJobFailed = process.env.SEMGREP_JOB_FAILED === 'true';
 
+            // Dependency severity order (from dependency-review-action)
+            // Default threshold: "high" (3) - blocks high and critical only
             const severityOrder = { low: 1, moderate: 2, high: 3, critical: 4 };
-            // Map Dodge severity levels (low/medium/high/critical) to Semgrep levels
+
+            // Semgrep/Dodge severity mapping
+            // Default threshold: "error" (3) - blocks high and critical only
+            // Maps both Semgrep CLI levels (note/warning/error) and Dodge levels (low/medium/high/critical)
             const semgrepSeverityOrder = {
               note: 1,
-              low: 1,       // Dodge low -> note
+              low: 1,       // Dodge low -> note (not blocked by default)
               warning: 2,
-              medium: 2,    // Dodge medium -> warning
+              medium: 2,    // Dodge medium -> warning (not blocked by default)
               error: 3,
-              high: 3,      // Dodge high -> error
-              critical: 4   // Dodge critical -> error (highest)
+              high: 3,      // Dodge high -> error (BLOCKED by default)
+              critical: 4   // Dodge critical -> error (BLOCKED by default)
             };
 
             let hasBlockingDeps = false;
